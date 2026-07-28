@@ -1,0 +1,26 @@
+# Virtual environments
+.venv/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Secrets and local environment variables
+.env
+.env.*
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Operating-system files
+.DS_Store
+Thumbs.db
