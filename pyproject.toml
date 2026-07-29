@@ -8,6 +8,9 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "einops>=0.8.2",
+    "jaxtyping>=0.3.11",
+    "numpy>=2.5.1",
     "torch>=2.13.0",
 ]
 
@@ -22,3 +25,8 @@ torch = { index = "pytorch-cpu" }
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
