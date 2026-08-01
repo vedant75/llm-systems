@@ -18,7 +18,7 @@ class SwiGLU(nn.Module):
     def __init__(
         self,
         d_model: int,
-        d_ff: int = None,
+        d_ff: int | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None
     ) -> None:
