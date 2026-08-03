@@ -22,6 +22,10 @@ class TransformerBlock(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+
         self.sa = MultiHeadAttention(
             d_model=d_model,
             num_heads=num_heads,
@@ -56,5 +60,12 @@ class TransformerBlock(nn.Module):
         token_pos
     ) -> Float[torch.Tensor, '... d_model']:
         x = x + self.sa(self.ln1(x), token_pos)
-        x = x + self.ffn(self.ln1(x))
+        x = x + self.ffn(self.ln2(x))
         return x
+
+    def extra_repr(self) -> str:
+        return (
+            f"d_model={self.d_model}, "
+            f"num_heads={self.num_heads}, "
+            f"d_ff={self.d_ff}"
+        )
