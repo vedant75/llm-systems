@@ -11,7 +11,7 @@ class RMSNorm(nn.Module):
             d_model: int,
             eps: float = 1e-5,
             device: torch.device | str | None = None,
-            dtype: torch.dtype = None
+            dtype: torch.dtype | None = None
     ) -> None:
         super().__init__()
 
