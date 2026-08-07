@@ -68,7 +68,7 @@ class TransformerLM(nn.Module):
     def forward(
         self,
         idx: Int[torch.Tensor, '... seq']
-    ) -> Float[torch.Tensor, '... d_model']:
+    ) -> Float[torch.Tensor, '... vocab_size']:
 
         seq_len = idx.shape[-1]
 
