@@ -1,6 +1,10 @@
 from collections import Counter
 
-from llm_systems.tokenization.helper import get_most_frequent_pair, apply_merge
+from llm_systems.tokenization.bpe_reference_helper import (
+    get_most_frequent_pair, 
+    apply_merge
+)
+
 from llm_systems.tokenization.bpe_tokenizer import train_bpe
 
 
