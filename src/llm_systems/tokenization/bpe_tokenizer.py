@@ -1,10 +1,10 @@
-import os
-import regex as re
-
-from collections import Counter
 from typing import List
 
-from .helper import pretokenize, get_most_frequent_pair, apply_merge
+from .bpe_reference_helper import (
+    pretokenize,
+    get_most_frequent_pair,
+    apply_merge
+)
 
 def train_bpe(
     input_path: str,
