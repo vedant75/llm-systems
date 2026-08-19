@@ -61,6 +61,24 @@ PAT = re.compile(
 )
 
 
+def pretokenize_text(
+    text: str,
+) -> list[tuple[bytes, ...]]:
+    pretokens = []
+
+    for match in re.finditer(PAT, text):
+        word_bytes = match.group().encode("utf-8")
+
+        symbols = tuple(
+            bytes([b])
+            for b in word_bytes
+        )
+
+        pretokens.append(symbols)
+    
+    return pretokens
+
+
 def pretokenize(
     input_path: str,
     start_byte: int,
@@ -95,15 +113,10 @@ def pretokenize(
     word_counts: Counter[tuple[bytes, ...]] = Counter()
 
     for document in documents:
-        for match in re.finditer(PAT, document):
-            word_bytes = match.group().encode("utf-8")
+        pretokens = pretokenize_text(document)
 
-            symbols = tuple(
-                bytes([b])
-                for b in word_bytes
-            )
-
-            word_counts[symbols] += 1
+        for pretoken in pretokens:
+            word_counts[pretoken] += 1
 
     return word_counts
 
@@ -213,3 +226,52 @@ def apply_incremental_merge(
         for pair, local_count in new_local_counts.items():
             pair_counts[pair] += local_count * freq
             pair_to_words[pair].add(word_id)
+
+
+# Tokenizer Helper
+def split_on_special_tokens(
+    text: str,
+    special_tokens: list[str],
+) -> list[tuple[str, bool]]:
+
+    if not special_tokens:
+        return [(text, False)]
+
+    # Longer special tokens first in case one token
+    # is a prefix/subsequence of another.
+    sorted_tokens = sorted(
+        special_tokens,
+        key=len,
+        reverse=True,
+    )
+
+    special_pattern = (
+        "("
+        + "|".join(
+            re.escape(token)
+            for token in sorted_tokens
+        )
+        + ")"
+    )
+
+    parts = re.split(
+        special_pattern,
+        text,
+    )
+
+    special_token_set = set(special_tokens)
+
+    result = []
+
+    for part in parts:
+        if part == "":
+            continue
+
+        result.append(
+            (
+                part,
+                part in special_token_set,
+            )
+        )
+
+    return result
