@@ -4,6 +4,8 @@ import timeit
 import statistics
 
 from llm_systems.nn.transformer_lm import TransformerLM
+from llm_systems.training.optimizer import AdamW
+from llm_systems.training.loss import cross_entropy_loss
 
 # command-line arguments
 
@@ -125,12 +127,37 @@ def main():
         device=device,
     )
 
-    # skipping optimizer
+    targets = torch.randint(
+        low=0,
+        high=args.vocab_size,
+        size=(
+            args.batch_size,
+            args.context_length,
+        ),
+        device=device,
+    )
+
+    # optimizer
+    optimizer = AdamW(
+        params= model.parameters(),
+        lr = 3e-4
+    )
 
     # warmup loop
     for _ in range(args.warmup_steps):
+        optimizer.zero_grad()
+
         logits = model(inputs)
+
+        loss = cross_entropy_loss(
+            logits,
+            targets
+        )
+
+        loss.backward()
+
         del logits
+        del loss
 
 
     # forward pass
@@ -139,23 +166,40 @@ def main():
 
 
     for step in range(args.measurement_steps):
+        
+        # zero grad
+        optimizer.zero_grad()
+
         # measurement
         # start time
         if device == "cuda":
             torch.cuda.synchronize()
+
         start_time = timeit.default_timer()
 
+        # forward
         logits = model(inputs)
+
+        # loss 
+        loss = cross_entropy_loss(
+            logits,
+            targets
+        )
+
+        # calculate backward
+        loss.backward()
 
         # end time
         if device == "cuda":
             torch.cuda.synchronize()
+
         end_time = timeit.default_timer()
 
         # save time
         iteration_time.append((end_time - start_time))
 
         del logits
+        del loss
 
 
     avg_time = sum(iteration_time) / len(iteration_time)
@@ -165,7 +209,7 @@ def main():
     std_ms = std_time * 1000
 
     print(
-        f"Average forward time: {avg_ms:.3f} ms\n"
+        f"Average forward + backward time: {avg_ms:.3f} ms\n"
         f"Standard deviation: {std_ms:.3f} ms"
     )
             
