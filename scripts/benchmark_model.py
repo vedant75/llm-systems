@@ -156,6 +156,8 @@ def main():
 
         loss.backward()
 
+        optimizer.step()
+
         del logits
         del loss
 
@@ -189,6 +191,9 @@ def main():
         # calculate backward
         loss.backward()
 
+        # Optimizer Step
+        optimizer.step()
+
         # end time
         if device == "cuda":
             torch.cuda.synchronize()
@@ -209,7 +214,7 @@ def main():
     std_ms = std_time * 1000
 
     print(
-        f"Average forward + backward time: {avg_ms:.3f} ms\n"
+        f"Average forward + backward + optimizer time: {avg_ms:.3f} ms\n"
         f"Standard deviation: {std_ms:.3f} ms"
     )
             
