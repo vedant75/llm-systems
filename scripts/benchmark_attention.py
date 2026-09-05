@@ -17,7 +17,14 @@ SEQ_LENGTHS = [256, 1024, 4096, 8192, 16384]
 WARMUP_STEPS = 5
 MEASUREMENT_STEPS = 100
 
-OUTPUT_FILE = "attention_benchmark_results.csv"
+OUTPUT_FILE = "attention_compile_benchmark_results.csv"
+
+
+eager_attention = scaled_dot_product_attention
+
+compiled_attention = torch.compile(
+    scaled_dot_product_attention
+)
 
 
 def synchronize(device: torch.device) -> None:
@@ -62,6 +69,7 @@ def create_inputs(
 
 
 def warmup_forward(
+    attention_fn,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -69,7 +77,7 @@ def warmup_forward(
     device: torch.device,
 ) -> None:
     for _ in range(steps):
-        output = scaled_dot_product_attention(
+        output = attention_fn(
             Q=q,
             K=k,
             V=v,
@@ -81,6 +89,7 @@ def warmup_forward(
 
 
 def benchmark_forward(
+    attention_fn,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -93,7 +102,7 @@ def benchmark_forward(
         synchronize(device)
         start = time.perf_counter()
 
-        output = scaled_dot_product_attention(
+        output = attention_fn(
             Q=q,
             K=k,
             V=v,
@@ -111,6 +120,7 @@ def benchmark_forward(
 
 
 def measure_memory_before_backward(
+    attention_fn,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -122,7 +132,7 @@ def measure_memory_before_backward(
 
     torch.cuda.reset_peak_memory_stats(device)
 
-    output = scaled_dot_product_attention(
+    output = attention_fn(
         Q=q,
         K=k,
         V=v,
@@ -140,7 +150,6 @@ def measure_memory_before_backward(
         allocated_before_backward - baseline_allocated
     )
 
-    # Release the graph normally.
     output.sum().backward()
     synchronize(device)
 
@@ -169,6 +178,7 @@ def measure_memory_before_backward(
 
 
 def warmup_backward(
+    attention_fn,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -176,7 +186,7 @@ def warmup_backward(
     device: torch.device,
 ) -> None:
     for _ in range(steps):
-        output = scaled_dot_product_attention(
+        output = attention_fn(
             Q=q,
             K=k,
             V=v,
@@ -196,6 +206,7 @@ def warmup_backward(
 
 
 def benchmark_backward(
+    attention_fn,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -205,8 +216,8 @@ def benchmark_backward(
     times = []
 
     for _ in range(steps):
-        # Build a fresh graph outside the timed region.
-        output = scaled_dot_product_attention(
+        # Build fresh graph outside timed region.
+        output = attention_fn(
             Q=q,
             K=k,
             V=v,
@@ -258,6 +269,7 @@ def qkv_memory_mib(
 
 
 def benchmark_configuration(
+    attention_fn,
     batch_size: int,
     seq_len: int,
     d: int,
@@ -270,7 +282,9 @@ def benchmark_configuration(
         device=device,
     )
 
+    # First calls also trigger compilation for compiled attention.
     warmup_forward(
+        attention_fn=attention_fn,
         q=q,
         k=k,
         v=v,
@@ -279,6 +293,7 @@ def benchmark_configuration(
     )
 
     forward_mean, forward_std = benchmark_forward(
+        attention_fn=attention_fn,
         q=q,
         k=k,
         v=v,
@@ -287,13 +302,16 @@ def benchmark_configuration(
     )
 
     memory = measure_memory_before_backward(
+        attention_fn=attention_fn,
         q=q,
         k=k,
         v=v,
         device=device,
     )
 
+    # First backward may also trigger backward compilation.
     warmup_backward(
+        attention_fn=attention_fn,
         q=q,
         k=k,
         v=v,
@@ -302,6 +320,7 @@ def benchmark_configuration(
     )
 
     backward_mean, backward_std = benchmark_backward(
+        attention_fn=attention_fn,
         q=q,
         k=k,
         v=v,
@@ -328,6 +347,7 @@ def save_results(results: list[dict]) -> None:
         return
 
     fieldnames = [
+        "implementation",
         "d",
         "seq_len",
         "status",
@@ -356,6 +376,52 @@ def save_results(results: list[dict]) -> None:
             writer.writerow(result)
 
 
+def print_comparison(results: list[dict]) -> None:
+    print("\n" + "=" * 80)
+    print("EAGER VS COMPILED")
+    print("=" * 80)
+
+    eager_results = {
+        (r["d"], r["seq_len"]): r
+        for r in results
+        if r["implementation"] == "eager"
+        and r["status"] == "OK"
+    }
+
+    compiled_results = {
+        (r["d"], r["seq_len"]): r
+        for r in results
+        if r["implementation"] == "compiled"
+        and r["status"] == "OK"
+    }
+
+    for key in eager_results.keys() & compiled_results.keys():
+        eager = eager_results[key]
+        compiled = compiled_results[key]
+
+        d, seq_len = key
+
+        forward_speedup = (
+            eager["forward_mean_ms"]
+            / compiled["forward_mean_ms"]
+        )
+
+        backward_speedup = (
+            eager["backward_mean_ms"]
+            / compiled["backward_mean_ms"]
+        )
+
+        print(
+            f"d={d:3d}, T={seq_len:5d} | "
+            f"FWD: {eager['forward_mean_ms']:.3f} -> "
+            f"{compiled['forward_mean_ms']:.3f} ms "
+            f"({forward_speedup:.2f}x) | "
+            f"BWD: {eager['backward_mean_ms']:.3f} -> "
+            f"{compiled['backward_mean_ms']:.3f} ms "
+            f"({backward_speedup:.2f}x)"
+        )
+
+
 def main():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required.")
@@ -367,109 +433,111 @@ def main():
     print(f"Warmup steps: {WARMUP_STEPS}")
     print(f"Measurement steps: {MEASUREMENT_STEPS}")
 
+    implementations = {
+        "eager": eager_attention,
+        "compiled": compiled_attention,
+    }
+
     results = []
 
-    for d in HEAD_DIMS:
-        for seq_len in SEQ_LENGTHS:
+    for implementation_name, attention_fn in implementations.items():
 
-            print(
-                f"\nB={BATCH_SIZE}, "
-                f"T={seq_len}, "
-                f"d={d}"
-            )
+        print("\n" + "=" * 80)
+        print(f"IMPLEMENTATION: {implementation_name.upper()}")
+        print("=" * 80)
 
-            score_memory = score_matrix_memory_mib(
-                BATCH_SIZE,
-                seq_len,
-            )
-
-            qkv_memory = qkv_memory_mib(
-                BATCH_SIZE,
-                seq_len,
-                d,
-            )
-
-            try:
-                result = benchmark_configuration(
-                    batch_size=BATCH_SIZE,
-                    seq_len=seq_len,
-                    d=d,
-                    device=device,
-                )
-
-                result.update({
-                    "d": d,
-                    "seq_len": seq_len,
-                    "status": "OK",
-                    "score_matrix_mib": score_memory,
-                    "qkv_mib": qkv_memory,
-                })
-
-                results.append(result)
+        for d in HEAD_DIMS:
+            for seq_len in SEQ_LENGTHS:
 
                 print(
-                    f"Forward: "
-                    f"{result['forward_mean_ms']:.3f} "
-                    f"± {result['forward_std_ms']:.3f} ms"
+                    f"\nImplementation={implementation_name}, "
+                    f"B={BATCH_SIZE}, "
+                    f"T={seq_len}, "
+                    f"d={d}"
                 )
 
-                print(
-                    f"Backward: "
-                    f"{result['backward_mean_ms']:.3f} "
-                    f"± {result['backward_std_ms']:.3f} ms"
+                score_memory = score_matrix_memory_mib(
+                    BATCH_SIZE,
+                    seq_len,
                 )
 
-                print(
-                    "Memory before backward: "
-                    f"{result['allocated_before_backward_mib']:.2f} MiB"
+                qkv_memory = qkv_memory_mib(
+                    BATCH_SIZE,
+                    seq_len,
+                    d,
                 )
 
-                print(
-                    "Extra forward memory: "
-                    f"{result['extra_forward_memory_mib']:.2f} MiB"
-                )
+                try:
+                    result = benchmark_configuration(
+                        attention_fn=attention_fn,
+                        batch_size=BATCH_SIZE,
+                        seq_len=seq_len,
+                        d=d,
+                        device=device,
+                    )
 
-                print(
-                    "Free GPU memory before backward: "
-                    f"{result['free_before_backward_mib']:.2f} MiB"
-                )
+                    result.update({
+                        "implementation": implementation_name,
+                        "d": d,
+                        "seq_len": seq_len,
+                        "status": "OK",
+                        "score_matrix_mib": score_memory,
+                        "qkv_mib": qkv_memory,
+                    })
 
-                print(
-                    "One [B,T,T] FP32 matrix: "
-                    f"{score_memory:.2f} MiB"
-                )
+                    results.append(result)
 
-                print(
-                    "Q+K+V memory: "
-                    f"{qkv_memory:.2f} MiB"
-                )
+                    print(
+                        f"Forward: "
+                        f"{result['forward_mean_ms']:.3f} "
+                        f"± {result['forward_std_ms']:.3f} ms"
+                    )
 
-            except torch.OutOfMemoryError:
-                print("OOM")
+                    print(
+                        f"Backward: "
+                        f"{result['backward_mean_ms']:.3f} "
+                        f"± {result['backward_std_ms']:.3f} ms"
+                    )
 
-                results.append({
-                    "d": d,
-                    "seq_len": seq_len,
-                    "status": "OOM",
-                    "forward_mean_ms": "",
-                    "forward_std_ms": "",
-                    "backward_mean_ms": "",
-                    "backward_std_ms": "",
-                    "score_matrix_mib": score_memory,
-                    "qkv_mib": qkv_memory,
-                    "allocated_before_backward_mib": "",
-                    "extra_forward_memory_mib": "",
-                    "peak_forward_memory_mib": "",
-                    "free_before_backward_mib": "",
-                    "total_gpu_memory_mib": "",
-                })
+                    print(
+                        "Extra forward memory: "
+                        f"{result['extra_forward_memory_mib']:.2f} MiB"
+                    )
 
-            finally:
-                gc.collect()
-                torch.cuda.empty_cache()
+                    print(
+                        "Peak forward memory: "
+                        f"{result['peak_forward_memory_mib']:.2f} MiB"
+                    )
 
-            # Save continuously in case a later configuration crashes.
-            save_results(results)
+                except torch.OutOfMemoryError:
+                    print("OOM")
+
+                    results.append({
+                        "implementation": implementation_name,
+                        "d": d,
+                        "seq_len": seq_len,
+                        "status": "OOM",
+                        "forward_mean_ms": "",
+                        "forward_std_ms": "",
+                        "backward_mean_ms": "",
+                        "backward_std_ms": "",
+                        "score_matrix_mib": score_memory,
+                        "qkv_mib": qkv_memory,
+                        "allocated_before_backward_mib": "",
+                        "extra_forward_memory_mib": "",
+                        "peak_forward_memory_mib": "",
+                        "free_before_backward_mib": "",
+                        "total_gpu_memory_mib": "",
+                    })
+
+                finally:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                # Save continuously in case a later configuration fails.
+                save_results(results)
+
+    print_comparison(results)
 
     print(f"\nFinished. Results saved to {OUTPUT_FILE}")
 
