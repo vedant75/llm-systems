@@ -1,15 +1,19 @@
-# tests/test_ddp.py
-
 import os
 import socket
+from copy import deepcopy
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
 
-from llm_systems.distributed.ddp import DDP
+from llm_systems.distributed.ddp import (
+    MinimalDDP,
+    FlatDDP,
+    OverlapDDP,
+)
 
 
 class ToyModel(nn.Module):
@@ -20,6 +24,13 @@ class ToyModel(nn.Module):
         self.relu = nn.ReLU()
         self.linear2 = nn.Linear(16, 10)
 
+        # Useful edge case:
+        # this parameter should never receive a gradient.
+        self.no_grad_fixed_param = nn.Parameter(
+            torch.tensor([2.0, 2.0]),
+            requires_grad=False,
+        )
+
     def forward(self, x):
         x = self.linear1(x)
         x = self.relu(x)
@@ -27,11 +38,10 @@ class ToyModel(nn.Module):
 
 
 def find_free_port():
-    """
-    Find an unused local port so that repeated pytest runs
-    don't conflict with an old distributed process group.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    with socket.socket(
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+    ) as sock:
         sock.bind(("", 0))
         return sock.getsockname()[1]
 
@@ -55,13 +65,16 @@ def cleanup_process_group():
     dist.destroy_process_group()
 
 
-def assert_parameters_same_across_ranks(model):
+def assert_models_equal_across_ranks(
+    model: nn.Module,
+):
     """
-    Verify that every rank has exactly the same model parameters.
+    Check that every rank has exactly the same parameters.
     """
     world_size = dist.get_world_size()
 
     for parameter in model.parameters():
+
         gathered = [
             torch.empty_like(parameter)
             for _ in range(world_size)
@@ -74,27 +87,28 @@ def assert_parameters_same_across_ranks(model):
 
         reference = gathered[0]
 
-        for rank_parameter in gathered[1:]:
+        for other in gathered[1:]:
             assert torch.allclose(
                 reference,
-                rank_parameter,
+                other,
                 atol=1e-6,
                 rtol=1e-5,
             )
 
 
-def assert_gradients_same_across_ranks(model):
+def assert_gradients_equal_across_ranks(
+    model: nn.Module,
+):
     """
-    Verify that synchronized gradients are identical on every rank.
+    Check that every synchronized gradient is identical
+    across all ranks.
     """
     world_size = dist.get_world_size()
 
     for parameter in model.parameters():
 
-        if not parameter.requires_grad:
+        if parameter.grad is None:
             continue
-
-        assert parameter.grad is not None
 
         gathered = [
             torch.empty_like(parameter.grad)
@@ -108,19 +122,20 @@ def assert_gradients_same_across_ranks(model):
 
         reference = gathered[0]
 
-        for rank_gradient in gathered[1:]:
+        for other in gathered[1:]:
             assert torch.allclose(
                 reference,
-                rank_gradient,
+                other,
                 atol=1e-6,
                 rtol=1e-5,
             )
 
 
-def _test_ddp_worker(
+def _ddp_worker(
     rank: int,
     world_size: int,
     port: int,
+    ddp_type: str,
 ):
     setup_process_group(
         rank,
@@ -129,32 +144,42 @@ def _test_ddp_worker(
     )
 
     # --------------------------------------------------
-    # 1. Give every rank a DIFFERENT initial model
+    # 1. Make each rank start from DIFFERENT weights.
     # --------------------------------------------------
 
     torch.manual_seed(rank)
 
-    baseline_model = ToyModel()
+    local_model = ToyModel()
 
-    # Make a separate model with the same LOCAL
-    # initialization before DDP changes anything.
-    ddp_base = ToyModel()
-    ddp_base.load_state_dict(
-        baseline_model.state_dict()
-    )
-
-    # Wrapping should broadcast rank 0 parameters.
-    ddp_model = DDP(ddp_base)
+    # Rank 0's model is our full-batch reference.
+    if rank == 0:
+        baseline_model = deepcopy(local_model)
 
     # --------------------------------------------------
-    # 2. Verify initialization synchronization
+    # 2. Wrap using the requested DDP implementation.
     # --------------------------------------------------
 
-    assert_parameters_same_across_ranks(
+    if ddp_type == "minimal":
+        ddp_model = MinimalDDP(local_model)
+
+    elif ddp_type == "flat":
+        ddp_model = FlatDDP(local_model)
+
+    elif ddp_type == "overlap":
+        ddp_model = OverlapDDP(local_model)
+
+    else:
+        raise ValueError(
+            f"Unknown DDP type: {ddp_type}"
+        )
+
+    # DDP constructor should have broadcast rank 0's
+    # parameters to every process.
+    assert_models_equal_across_ranks(
         ddp_model
     )
 
-    # Rank 0 should still equal its original model.
+    # Rank 0 should still exactly match its original model.
     if rank == 0:
         for baseline_parameter, ddp_parameter in zip(
             baseline_model.parameters(),
@@ -166,10 +191,9 @@ def _test_ddp_worker(
             )
 
     # --------------------------------------------------
-    # 3. Create one GLOBAL dataset
+    # 3. Create identical GLOBAL data on every rank.
     # --------------------------------------------------
 
-    # Every process must create exactly the same dataset.
     torch.manual_seed(1234)
 
     all_x = torch.randn(20, 10)
@@ -188,25 +212,25 @@ def _test_ddp_worker(
         lr=0.1,
     )
 
-    baseline_optimizer = optim.SGD(
-        baseline_model.parameters(),
-        lr=0.1,
-    )
+    if rank == 0:
+        baseline_optimizer = optim.SGD(
+            baseline_model.parameters(),
+            lr=0.1,
+        )
 
     # --------------------------------------------------
-    # 4. Train for multiple iterations
+    # 4. Run several training iterations.
     # --------------------------------------------------
 
     for step in range(5):
 
         ddp_optimizer.zero_grad()
-        baseline_optimizer.zero_grad()
+
+        if rank == 0:
+            baseline_optimizer.zero_grad()
 
         # ==============================================
-        # Normal single-process baseline
-        #
-        # Only rank 0 needs this for our comparison.
-        # It sees the COMPLETE batch.
+        # Full-batch baseline
         # ==============================================
 
         if rank == 0:
@@ -222,9 +246,9 @@ def _test_ddp_worker(
             baseline_loss.backward()
 
         # ==============================================
-        # DDP
+        # Distributed path
         #
-        # Each rank sees a DISJOINT shard.
+        # Each rank receives a disjoint half of the batch.
         # ==============================================
 
         start = rank * local_batch_size
@@ -244,29 +268,33 @@ def _test_ddp_worker(
 
         ddp_loss.backward()
 
-        # Our hooks launched asynchronous all-reduces
-        # during backward.
-        #
-        # Now wait for them and average the gradients.
+        # This performs the different synchronization
+        # strategy for Minimal / Flat / Overlap DDP.
         ddp_model.finish_gradient_synchronization()
 
         # --------------------------------------------------
-        # 5. Verify gradients are identical across ranks
+        # 5. All ranks must now hold the same gradients.
         # --------------------------------------------------
 
-        assert_gradients_same_across_ranks(
+        assert_gradients_equal_across_ranks(
             ddp_model
         )
 
         # --------------------------------------------------
-        # 6. Baseline gradient should equal DDP gradient
+        # 6. DDP gradient should equal full-batch gradient.
         # --------------------------------------------------
 
         if rank == 0:
+
             for baseline_parameter, ddp_parameter in zip(
                 baseline_model.parameters(),
                 ddp_model.parameters(),
             ):
+
+                if baseline_parameter.grad is None:
+                    assert ddp_parameter.grad is None
+                    continue
+
                 assert torch.allclose(
                     baseline_parameter.grad,
                     ddp_parameter.grad,
@@ -275,7 +303,7 @@ def _test_ddp_worker(
                 )
 
         # --------------------------------------------------
-        # 7. Apply optimizer updates
+        # 7. Take optimizer steps.
         # --------------------------------------------------
 
         ddp_optimizer.step()
@@ -284,18 +312,19 @@ def _test_ddp_worker(
             baseline_optimizer.step()
 
         # --------------------------------------------------
-        # 8. All DDP replicas should remain identical
+        # 8. All distributed replicas must stay identical.
         # --------------------------------------------------
 
-        assert_parameters_same_across_ranks(
+        assert_models_equal_across_ranks(
             ddp_model
         )
 
         # --------------------------------------------------
-        # 9. Rank-0 DDP should match full-batch baseline
+        # 9. DDP should exactly reproduce full-batch training.
         # --------------------------------------------------
 
         if rank == 0:
+
             for baseline_parameter, ddp_parameter in zip(
                 baseline_model.parameters(),
                 ddp_model.parameters(),
@@ -308,7 +337,7 @@ def _test_ddp_worker(
                 )
 
         # --------------------------------------------------
-        # 10. Shuffle for the next step
+        # 10. Shuffle identically before next iteration.
         # --------------------------------------------------
 
         torch.manual_seed(42 + step)
@@ -323,16 +352,26 @@ def _test_ddp_worker(
     cleanup_process_group()
 
 
-def test_ddp():
+@pytest.mark.parametrize(
+    "ddp_type",
+    [
+        "minimal",
+        "flat",
+        "overlap",
+    ],
+)
+def test_ddp_correctness(
+    ddp_type: str,
+):
     world_size = 2
-
     port = find_free_port()
 
     mp.spawn(
-        _test_ddp_worker,
+        _ddp_worker,
         args=(
             world_size,
             port,
+            ddp_type,
         ),
         nprocs=world_size,
         join=True,
